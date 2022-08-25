@@ -21,12 +21,6 @@
 #include "il2cpp-runtime-stats.h"
 #include <string>
 
-// ==={{ hybridclr
-#include "hybridclr/metadata/MetadataUtil.h"
-#include "hybridclr/metadata/MetadataModule.h"
-#include "hybridclr/interpreter/InterpreterModule.h"
-// ===}} hybridclr
-
 using il2cpp::metadata::GenericMetadata;
 using il2cpp::metadata::GenericSharing;
 using il2cpp::os::FastAutoLock;
@@ -69,8 +63,9 @@ namespace il2cpp
 {
 namespace metadata
 {
-    typedef Il2CppHashMap<const Il2CppGenericMethod*, MethodInfo*, Il2CppGenericMethodHash, Il2CppGenericMethodCompare> Il2CppGenericMethodMap;
+    typedef Il2CppReaderWriterLockedHashMap<const Il2CppGenericMethod*, MethodInfo*, Il2CppGenericMethodHash, Il2CppGenericMethodCompare> Il2CppGenericMethodMap;
     static Il2CppGenericMethodMap s_GenericMethodMap;
+    static Il2CppGenericMethodMap s_PendingGenericMethodMap;
 
     static bool HasFullGenericSharedParametersOrReturn(const MethodInfo* methodDefinition)
     {
@@ -141,8 +136,6 @@ namespace metadata
 
     const MethodInfo* GenericMethod::GetMethod(const Il2CppGenericMethod* gmethod, bool copyMethodPtr)
     {
-        FastAutoLock lock(&il2cpp::vm::g_MetadataLock);
-
         // This can be NULL only when we have hit the generic recursion depth limit.
         if (gmethod == NULL)
         {
@@ -156,9 +149,10 @@ namespace metadata
             return newMethod;
         }
 
-        Il2CppGenericMethodMap::const_iterator iter = s_GenericMethodMap.find(gmethod);
-        if (iter != s_GenericMethodMap.end())
-            return iter->second;
+        // First check for an already constructed generic method using the shared/reader lock
+        MethodInfo* existingMethod;
+        if (s_GenericMethodMap.TryGet(gmethod, &existingMethod))
+            return existingMethod;
 
         if (Method::IsAmbiguousMethodInfo(gmethod->methodDefinition))
         {
@@ -174,6 +168,24 @@ namespace metadata
 
             return &ambiguousMethodInfo;
         }
+
+        return CreateMethodLocked(gmethod, copyMethodPtr);
+    }
+
+    const MethodInfo* GenericMethod::CreateMethodLocked(const Il2CppGenericMethod* gmethod, bool copyMethodPtr)
+    {
+        // We need to inflate a new generic method, take the metadata mutex
+        // All code below this point can and does assume mutual exclusion
+        FastAutoLock lock(&il2cpp::vm::g_MetadataLock);
+
+        // Recheck the s_GenericMethodMap in case there was a race to add this generic method
+        MethodInfo* existingMethod;
+        if (s_GenericMethodMap.TryGet(gmethod, &existingMethod))
+            return existingMethod;
+
+        // GetMethodLocked may be called recursively, we keep tracking of pending inflations
+        if (s_PendingGenericMethodMap.TryGet(gmethod, &existingMethod))
+            return existingMethod;
 
         if (copyMethodPtr)
             gmethod = MetadataCache::GetGenericMethod(gmethod->methodDefinition, gmethod->context.class_inst, gmethod->context.method_inst);
@@ -193,10 +205,10 @@ namespace metadata
 
         MethodInfo* newMethod = AllocGenericMethodInfo();
 
-        // we set this here because the initialization may recurse and try to retrieve the same generic method
+        // we set the pending generic method map here because the initialization may recurse and try to retrieve the same generic method
         // this is safe because we *always* take the lock when retrieving the MethodInfo from a generic method.
         // if we move lock to only if MethodInfo needs constructed then we need to revisit this since we could return a partially initialized MethodInfo
-        s_GenericMethodMap.insert(std::make_pair(gmethod, newMethod));
+        s_PendingGenericMethodMap.Add(gmethod, newMethod);
 
         newMethod->klass = declaringClass;
         newMethod->flags = methodDefinition->flags;
@@ -239,22 +251,12 @@ namespace metadata
         {
             newMethod->invoker_method = methodPointers.invoker_method;
         }
-        else if (hybridclr::metadata::IsInterpreterMethod(newMethod) || hybridclr::metadata::MetadataModule::IsImplementedByInterpreter(newMethod))
-        {
-            newMethod->invoker_method = hybridclr::interpreter::InterpreterModule::GetMethodInvoker(newMethod);
-            newMethod->methodPointer = hybridclr::interpreter::InterpreterModule::GetMethodPointer(newMethod);
-            newMethod->virtualMethodPointer = Method::IsInstance(newMethod) ?
-                (IS_CLASS_VALUE_TYPE(newMethod->klass) ? hybridclr::interpreter::InterpreterModule::GetAdjustThunkMethodPointer(newMethod) : hybridclr::interpreter::InterpreterModule::GetMethodPointer(newMethod))
-                : nullptr;
-            newMethod->isInterpterImpl = true;
-        }
         else
         {
             newMethod->invoker_method = Runtime::GetMissingMethodInvoker();
             if (Method::IsInstance(newMethod))
                 newMethod->virtualMethodPointer = MetadataCache::GetUnresolvedVirtualCallStub(newMethod);
         }
-        // ===}} hybridclr
 
         newMethod->has_full_generic_sharing_signature = methodPointers.isFullGenericShared && HasFullGenericSharedParametersOrReturn(gmethod->methodDefinition);
 
@@ -262,19 +264,6 @@ namespace metadata
         // And invalid static methods can't use the unresolved virtual call stubs
         newMethod->indirect_call_via_invokers = newMethod->has_full_generic_sharing_signature || (!Method::IsInstance(newMethod) && newMethod->methodPointer == NULL);
 
-        // now we don't support full generic sharing method, so we use interpreter mode
-        if (newMethod->indirect_call_via_invokers)
-        {
-            if (hybridclr::metadata::MetadataModule::IsImplementedByInterpreter(newMethod))
-            {
-                newMethod->interpCallMethodPointer = hybridclr::interpreter::InterpreterModule::GetMethodPointer(newMethod);
-                newMethod->isInterpterImpl = true;
-            }
-        }
-        else
-        {
-            newMethod->interpCallMethodPointer = newMethod->methodPointer;
-        }
         ++il2cpp_runtime_stats.inflated_method_count;
 
         if (il2cpp::vm::Runtime::IsFullGenericSharingEnabled())
@@ -289,6 +278,16 @@ namespace metadata
         // If we are a default interface method on a generic instance interface we need to ensure that the interfaces rgctx is inflated
         if (Method::IsDefaultInterfaceMethodOnGenericInstance(newMethod))
             vm::Class::InitLocked(declaringClass, lock);
+
+        // The generic method is fully created,
+        // Update the generic method map, this needs to take an exclusive lock
+        // **** This must happen with the metadata lock held and be released before the metalock is released ****
+        // **** This prevents deadlocks and ensures that there is no race condition
+        // **** creating a new method adding it to s_GenericMethodMap and removing it from s_PendingGenericMethodMap
+        s_GenericMethodMap.Add(gmethod, newMethod);
+
+        // Remove the method from the pending table
+        s_PendingGenericMethodMap.Remove(gmethod);
 
         return newMethod;
     }
@@ -353,7 +352,7 @@ namespace metadata
 
     void GenericMethod::ClearStatics()
     {
-        s_GenericMethodMap.clear();
+        s_GenericMethodMap.Clear();
     }
 } /* namespace vm */
 } /* namespace il2cpp */

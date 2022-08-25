@@ -44,14 +44,6 @@
 #include <limits>
 #include <stdarg.h>
 
-// ==={{ hybridclr
-#include <set>
-#include "hybridclr/metadata/MetadataUtil.h"
-#include "hybridclr/interpreter/Engine.h"
-#include "hybridclr/interpreter/Interpreter.h"
-#include "hybridclr/interpreter/InterpreterModule.h"
-// ===}} hybridclr
-
 namespace il2cpp
 {
 namespace vm
@@ -61,6 +53,7 @@ namespace vm
     static il2cpp::utils::dynamic_array<Il2CppClass*> s_staticFieldData;
     static int32_t s_FinalizerSlot = -1;
     static int32_t s_GetHashCodeSlot = -1;
+    static Il2CppClass* s_EmptyClassList[] = {NULL};
 
     static void SetupGCDescriptor(Il2CppClass* klass, const il2cpp::os::FastAutoLock& lock);
     static void GetBitmapNoInit(Il2CppClass* klass, size_t* bitmap, size_t& maxSetBit, size_t parentOffset, const il2cpp::os::FastAutoLock* lockPtr);
@@ -235,6 +228,12 @@ namespace vm
                 for (uint16_t i = 0; i < klass->interfaces_count; i++)
                     klass->implementedInterfaces[i] = Class::FromIl2CppType(MetadataCache::GetInterfaceFromOffset(klass, i));
             }
+        }
+
+        if (klass->implementedInterfaces == NULL)
+        {
+            IL2CPP_ASSERT(klass->interfaces_count == 0);
+            klass->implementedInterfaces = s_EmptyClassList;
         }
     }
 
@@ -959,14 +958,6 @@ namespace vm
             klass->minimumAlignment = sizeof(Il2CppObject*);
         }
 
-        // ==={{ hybridclr
-        bool isInterpreterType = hybridclr::metadata::IsInterpreterType(klass);
-        bool computSize = klass->instance_size == 0 && isInterpreterType;
-        bool isExplictLayout = klass->flags & TYPE_ATTRIBUTE_EXPLICIT_LAYOUT;
-        bool computLayout = isInterpreterType;
-        bool computInstanceFieldLayout = !isExplictLayout && isInterpreterType;
-        // ===}} hybridclr
-
         if (klass->field_count)
         {
             for (uint16_t i = 0; i < klass->field_count; i++)
@@ -997,85 +988,15 @@ namespace vm
                 klass->actualSize = IL2CPP_SIZEOF_STRUCT_WITH_NO_INSTANCE_FIELDS + sizeof(Il2CppObject);
             }
 
-// ==={{ hybridclr
-            // comput size when explicit layout
-            if (computSize && isExplictLayout && !layoutData.FieldOffsets.empty())
-            {
-                instanceSize = IL2CPP_SIZEOF_STRUCT_WITH_NO_INSTANCE_FIELDS + sizeof(Il2CppObject);
-                for (size_t i = 0; i < klass->field_count; i++)
-                {
-                    FieldInfo* field = klass->fields + i;
-                    if (Field::IsInstance(field))
-                    {
-                        const Il2CppType* ftype = Type::GetUnderlyingType(field->type);
-                        il2cpp::metadata::SizeAndAlignment sa = il2cpp::metadata::FieldLayout::GetTypeSizeAndAlignment(ftype);
-                        // offset has add ObjectHeader
-                        instanceSize = std::max(instanceSize, field->offset + sa.size);
-                    }
-                }
-            }
-
             instanceSize = UpdateInstanceSizeForGenericClass(klass, instanceSize);
 
-            // must set instance_size before comput static fields.
-            if (computSize)
-            {
-                klass->instance_size = (uint32_t)instanceSize;
-                klass->native_size = (uint32_t)instanceSize;
-                klass->actualSize = (uint32_t)instanceSize;
-            }
-
-            IL2CPP_ASSERT(klass->instance_size > 0);
             klass->size_inited = true;
 
             il2cpp::metadata::FieldLayout::LayoutFields(klass, Field::IsNormalStatic, 0, 0, 1, 0, staticLayoutData);
             il2cpp::metadata::FieldLayout::LayoutFields(klass, Field::IsThreadStatic, 0, 0, 1, 0, threadStaticLayoutData);
 
-            if (computLayout)
-            {
-                uint32_t fieldIndex = 0;
-                uint32_t staticFieldIndex = 0;
-                uint32_t threadStaticFieldIndex = 0;
-                for (size_t i = 0; i < klass->field_count ; i++)
-                {
-                    FieldInfo* field = klass->fields + i;
-                    const Il2CppType* ftype = Type::GetUnderlyingType(field->type);
-                    if (Field::IsInstance(field))
-                    {
-                        if (computInstanceFieldLayout)
-                        {
-                            field->offset = (int32_t)layoutData.FieldOffsets[fieldIndex++];
-                        }
-                        else
-                        {
-                            fieldIndex++;
-                            IL2CPP_ASSERT(field->offset > 0);
-                        }
-                    }
-                    else if (Field::IsNormalStatic(field))
-                    {
-                        field->offset = (int32_t)staticLayoutData.FieldOffsets[staticFieldIndex++];
-                    }
-                    else if (Field::IsThreadStatic(field))
-                    {
-                        // not set field->offset;
-                        //field->offset = (int32_t)threadStaticLayoutData.FieldOffsets[threadStaticFieldIndex++];
-                        // because we not correctly init field->offset when create FieldInfo
-                        int32_t offset = (int32_t)threadStaticLayoutData.FieldOffsets[threadStaticFieldIndex++];
-                        il2cpp::vm::MetadataCache::FixThreadLocalStaticOffsetForFieldLocked(field, offset, lock);
-                    }
-                }
-            }
-
             klass->minimumAlignment = layoutData.minimumAlignment;
-            if (!isInterpreterType)
-            {
-                klass->actualSize = static_cast<uint32_t>(layoutData.actualClassSize);
-            }
-            else
-            {
-                // nothing todo
-            }
+            klass->actualSize = static_cast<uint32_t>(layoutData.actualClassSize);
 
             if (klass->image == il2cpp_defaults.corlib && !strcmp("Ephemeron", klass->name))
             {
@@ -1084,10 +1005,6 @@ namespace vm
 
             size_t staticSize = staticLayoutData.classSize;
             size_t threadStaticSize = threadStaticLayoutData.classSize;
-            klass->static_fields_size = (uint32_t)staticSize;
-            klass->thread_static_fields_size = (uint32_t)threadStaticSize;
-
-// ===}} hybridclr
 
             if (klass->generic_class)
             {
@@ -1106,15 +1023,6 @@ namespace vm
         }
         else
         {
-// ==={{ hybridclr
-            if (computSize)
-            {
-                if (IS_CLASS_VALUE_TYPE(klass))
-                {
-                    instanceSize = actualSize = IL2CPP_SIZEOF_STRUCT_WITH_NO_INSTANCE_FIELDS + sizeof(Il2CppObject);
-                }
-            }
-// ===}} hybridclr
             // need to set this in case there are no fields in a generic instance type
             instanceSize = UpdateInstanceSizeForGenericClass(klass, instanceSize);
 
@@ -1123,14 +1031,6 @@ namespace vm
             // field of the base class doesn't go to an alignment boundary and the compiler ABI
             // uses that extra space (as clang does).
             klass->actualSize = static_cast<uint32_t>(actualSize);
-
-// ==={{ hybridclr
-            if (computSize)
-            {
-                klass->instance_size = (uint32_t)instanceSize;
-                klass->native_size = (uint32_t)instanceSize;
-            }
-// ===}} hybridclr
         }
 
         if (klass->static_fields_size)
@@ -1186,8 +1086,8 @@ namespace vm
         if (klass->generic_class)
         {
             // for generic instance types, they just inflate the fields of their generic type definition
-            // initialize the generic type definition and delegate to the generic logic
-            Class::InitLocked(GenericClass::GetTypeDefinition(klass->generic_class), lock);
+            // initialize the generic type's fields and delegate to the generic logic
+            SetupFieldsLocked(GenericClass::GetTypeDefinition(klass->generic_class), lock);
             GenericClass::SetupFields(klass);
         }
         else
@@ -1260,7 +1160,6 @@ namespace vm
                 if (newMethod->virtualMethodPointer == NULL)
                     newMethod->virtualMethodPointer = newMethod->methodPointer;
 
-                newMethod->isInterpterImpl = hybridclr::metadata::IsInterpreterType(klass);
                 newMethod->klass = klass;
                 newMethod->return_type = methodInfo.return_type;
 
@@ -1565,14 +1464,20 @@ namespace vm
 
     void Class::SetupTypeHierarchy(Il2CppClass *klass)
     {
-        il2cpp::os::FastAutoLock lock(&g_MetadataLock);
-        SetupTypeHierarchyLocked(klass, lock);
+        if (klass->typeHierarchy == NULL)
+        {
+            il2cpp::os::FastAutoLock lock(&g_MetadataLock);
+            SetupTypeHierarchyLocked(klass, lock);
+        }
     }
 
     void Class::SetupInterfaces(Il2CppClass *klass)
     {
-        il2cpp::os::FastAutoLock lock(&g_MetadataLock);
-        SetupInterfacesLocked(klass, lock);
+        if (klass->implementedInterfaces == NULL)
+        {
+            il2cpp::os::FastAutoLock lock(&g_MetadataLock);
+            SetupInterfacesLocked(klass, lock);
+        }
     }
 
     bool Class::InitLocked(Il2CppClass *klass, const il2cpp::os::FastAutoLock& lock)
@@ -1967,9 +1872,15 @@ namespace vm
 
     Il2CppClass* Class::GetPtrClass(Il2CppClass* elementClass)
     {
+        // Check if the pointer class was created before taking the g_MetadataLock
+        Il2CppClass* pointerClass = MetadataCache::GetPointerType(elementClass);
+        if (pointerClass)
+            return pointerClass;
+
         il2cpp::os::FastAutoLock lock(&g_MetadataLock);
 
-        Il2CppClass* pointerClass = MetadataCache::GetPointerType(elementClass);
+        // Check if the pointer class was created while we were waiting for the g_MetadataLock
+        pointerClass = MetadataCache::GetPointerType(elementClass);
         if (pointerClass)
             return pointerClass;
 
@@ -1992,7 +1903,7 @@ namespace vm
         pointerClass->typeHierarchyDepth = 1;
         pointerClass->castClass = pointerClass->element_class = elementClass;
 
-        MetadataCache::AddPointerType(elementClass, pointerClass);
+        MetadataCache::AddPointerTypeLocked(elementClass, pointerClass, lock);
 
         return pointerClass;
     }
@@ -2250,45 +2161,13 @@ namespace vm
             }
 
             klass = Image::FromTypeNameParseInfo(image, info, searchFlags & kTypeSearchFlagIgnoreCase);
-            if (klass)
-            {
-                return klass;
-            }
-            // ==={{ hybridclr
-            hybridclr::interpreter::MachineState& state = hybridclr::interpreter::InterpreterModule::GetCurrentThreadMachineState();
-            const hybridclr::interpreter::InterpFrame* frame = state.GetTopFrame();
-            if (frame)
-            {
-                const Il2CppImage* interpImage = frame->method->method->klass->image;
-                if (interpImage != image)
-                {
-                    klass = Image::FromTypeNameParseInfo(interpImage, info, searchFlags & kTypeSearchFlagIgnoreCase);
-                    if (klass)
-                    {
-                        return klass;
-                    }
-                }
-            }
-            const  Il2CppImage* interpImage = state.GetTopExecutingImage();
-            if (interpImage)
-            {
-                klass = Image::FromTypeNameParseInfo(interpImage, info, searchFlags & kTypeSearchFlagIgnoreCase);
-                if (klass)
-                {
-                    return klass;
-                }
-            }
-            // ===}} hybridclr
 
-            // First, try mscorlib            if (klass == NULL && image != Image::GetCorlib())
-            klass = Image::FromTypeNameParseInfo(Image::GetCorlib(), info, searchFlags & kTypeSearchFlagIgnoreCase);
-            if (klass)
-            {
-                return klass;
-            }
+            // First, try mscorlib
+            if (klass == NULL && image != Image::GetCorlib())
+                klass = Image::FromTypeNameParseInfo(Image::GetCorlib(), info, searchFlags & kTypeSearchFlagIgnoreCase);
 
             // If we did not find it, now look in all loaded assemblies, except the ones we have tried already.
-            if (!dontUseExecutingImage)
+            if (klass == NULL && !dontUseExecutingImage)
             {
                 for (auto assembly : *Assembly::GetAllAssemblies())
                 {
@@ -2296,8 +2175,8 @@ namespace vm
                     if (currentImage != Image::GetCorlib() && currentImage != image)
                     {
                         klass = Image::FromTypeNameParseInfo(currentImage, info, searchFlags & kTypeSearchFlagIgnoreCase);
-                        if (klass)
-                            return klass;
+                        if (klass != NULL)
+                            break;
                     }
                 }
             }
